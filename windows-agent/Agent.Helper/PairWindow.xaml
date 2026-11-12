@@ -1,0 +1,18 @@
+<Window x:Class="KidSafe.Agent.Helper.PairWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="KidSafe - Ghép nối" Width="420" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen" Topmost="True">
+    <StackPanel Margin="24">
+        <TextBlock Text="Ghép nối với phụ huynh" FontSize="22" FontWeight="Bold"/>
+        <TextBlock TextWrapping="Wrap" Margin="0,8,0,16" Foreground="#FF475569"
+                   Text="Nhập mã 6 ký tự hiển thị trong ứng dụng của phụ huynh (mục “Thêm máy Windows”)."/>
+        <TextBox x:Name="CodeBox" MaxLength="6" FontSize="32" FontFamily="Consolas" TextAlignment="Center"
+                 CharacterCasing="Upper" Padding="8"/>
+        <TextBlock Text="Tên máy" Margin="0,16,0,4" Foreground="#FF475569"/>
+        <TextBox x:Name="NameBox" FontSize="16" Padding="6"/>
+        <Button x:Name="PairButton" Content="Ghép nối" FontSize="18" Padding="10" Margin="0,20,0,0"
+                Background="#FF2563EB" Foreground="White" BorderThickness="0" IsDefault="True" Click="Pair_Click"/>
+        <TextBlock x:Name="StatusText" Margin="0,12,0,0" TextWrapping="Wrap" Foreground="#FFB91C1C"/>
+    </StackPanel>
+</Window>

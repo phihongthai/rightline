@@ -79,7 +79,8 @@ export const agentWs: FastifyPluginAsync = async (app) => {
     });
     const policy = await db.policy.findUnique({ where: { deviceId } });
     if (policy) socket.send(JSON.stringify({ type: "policy:sync", payload: serializePolicy(policy) }));
-    if (dev.manualLocked) socket.send(JSON.stringify({ type: "command:lock" }));
+    // Always state the manual-lock intent so an agent that missed an unlock while offline resyncs.
+    socket.send(JSON.stringify({ type: dev.manualLocked ? "command:lock" : "command:unlock" }));
     if (dev.extraTimeUntil && dev.extraTimeUntil > new Date())
       socket.send(
         JSON.stringify({ type: "command:grant_time", payload: { extra_time_until: dev.extraTimeUntil.toISOString() } }),

@@ -82,8 +82,19 @@ describe("policy sync", () => {
     const row = await prisma.policy.findUniqueOrThrow({ where: { deviceId: d.id } });
     expect(row.version).toBe(1);
     await new Promise((r) => setTimeout(r, 150));
-    expect(agent.messages).toHaveLength(0);
+    expect(agent.messages.filter((m) => m.type === "policy:sync")).toHaveLength(0);
     await agent.close();
+  });
+
+  it("connect always states the manual-lock intent", async () => {
+    const { agent, parent, d, token } = await setup();
+    await agent.next("command:unlock");
+    await agent.close();
+    await ctx.app.inject({ method: "POST", url: `/api/devices/${d.id}/lock`, headers: bearer(parent) });
+    await ctx.app.inject({ method: "POST", url: `/api/devices/${d.id}/unlock`, headers: bearer(parent) });
+    const again = await connectAgent(ctx.wsBase, token);
+    await again.next("command:unlock");
+    await again.close();
   });
 
   it("offline agent gets the latest policy on reconnect", async () => {
