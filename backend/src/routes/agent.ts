@@ -1,5 +1,6 @@
 import type { FastifyPluginAsync } from "fastify";
 import { randomUUID } from "node:crypto";
+import bcrypt from "bcryptjs";
 import { z } from "zod";
 import { hashToken, newDeviceToken } from "../lib/tokens.js";
 
@@ -92,4 +93,16 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
     });
     return reply.code(201).send({ inserted: r.count });
   });
+
+  /** Uninstall authorisation: the owning parent's account password. */
+  app.post(
+    "/uninstall-auth",
+    { onRequest: app.authAgent, config: { rateLimit: { max: app.deps.config.pairRateLimitPerMin, timeWindow: "1 minute" } } },
+    async (req, reply) => {
+      const { password } = z.object({ password: z.string().min(1).max(200) }).parse(req.body);
+      const owner = await db.user.findUniqueOrThrow({ where: { id: req.agentDevice!.userId } });
+      if (!(await bcrypt.compare(password, owner.passwordHash))) return reply.code(401).send({ error: "invalid_password" });
+      return { ok: true };
+    },
+  );
 };

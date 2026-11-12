@@ -20,12 +20,15 @@ public static class IpcNames
     public const string Idle = "idle";
     public const string PairSubmit = "pair:submit";
     public const string TimeRequest = "time_request";
+    public const string Screenshot = "screenshot";
 }
 
 public sealed record HelperState(
     bool Paired, bool Locked, string Reason, string Message, bool Online,
-    int ActiveMinutes, int? DailyLimitMinutes, DateTimeOffset? ExtraTimeUntil);
-public sealed record IdlePayload(double IdleSeconds, string? ForegroundApp);
+    int ActiveMinutes, int? DailyLimitMinutes, DateTimeOffset? ExtraTimeUntil,
+    bool ScreenshotEnabled = false, int ScreenshotIntervalSec = 60);
+public sealed record IdlePayload(double IdleSeconds, string? ForegroundApp, string? ForegroundTitle = null);
+public sealed record ScreenshotPayload(DateTimeOffset CapturedAt, string Data);
 public sealed record PairSubmitPayload(string Code, string? MachineName);
 public sealed record TimeRequestPayload(int Minutes, string Reason);
 public sealed record ResultPayload(bool Ok, string? Error);
@@ -91,6 +94,7 @@ public sealed class IpcServer(Func<NamedPipeServerStream> createPipe, Func<Named
 
     public event Func<IpcMessage, Task>? MessageReceived;
     public event Action? ClientConnected;
+    public event Action? ClientRejected;
     public bool HasClient { get { lock (_lock) return _current is not null; } }
 
     public async Task RunAsync(CancellationToken ct)
@@ -101,7 +105,7 @@ public sealed class IpcServer(Func<NamedPipeServerStream> createPipe, Func<Named
             var pipe = createPipe();
             try { await pipe.WaitForConnectionAsync(ct); }
             catch { pipe.Dispose(); break; }
-            if (authorizeClient is not null && !SafeAuthorize(pipe)) { pipe.Dispose(); continue; }
+            if (authorizeClient is not null && !SafeAuthorize(pipe)) { pipe.Dispose(); ClientRejected?.Invoke(); continue; }
             var conn = new IpcConnection(pipe);
             IpcConnection? old;
             lock (_lock) { old = _current; _current = conn; }

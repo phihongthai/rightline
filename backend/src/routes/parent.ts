@@ -2,7 +2,7 @@ import type { FastifyPluginAsync, RouteHandlerMethod } from "fastify";
 import type { Device } from "@prisma/client";
 import { z } from "zod";
 import { PolicyPatch, defaultPolicyData, patchToData, serializePolicy } from "../lib/policy.js";
-import { generatePairingCode } from "../lib/tokens.js";
+import { generatePairingCode, uninstallPin } from "../lib/tokens.js";
 
 const IdParam = z.object({ id: z.string().uuid() });
 const uuid = z.string().uuid();
@@ -103,6 +103,15 @@ export const parentRoutes: FastifyPluginAsync = async (app) => {
       },
     });
     return serializeDevice(d);
+  });
+
+  /** PIN the parent reads out to allow uninstalling the agent today (UTC date). */
+  app.get("/devices/:id/uninstall-pin", auth, async (req, reply) => {
+    const { id } = IdParam.parse(req.params);
+    const d = await owned(req.user.sub, id);
+    if (!d.deviceTokenHash) return reply.code(409).send({ error: "not_paired" });
+    const date = new Date().toISOString().slice(0, 10);
+    return { pin: uninstallPin(d.deviceTokenHash, date), valid_for_date_utc: date };
   });
 
   // ---- commands ----

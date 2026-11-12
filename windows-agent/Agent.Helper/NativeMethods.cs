@@ -18,6 +18,18 @@ internal static class NativeMethods
         return unchecked((uint)Environment.TickCount - info.dwTime) / 1000.0;
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int max);
+
+    public static string? ForegroundTitle()
+    {
+        try
+        {
+            var sb = new System.Text.StringBuilder(256);
+            return GetWindowText(GetForegroundWindow(), sb, sb.Capacity) > 0 ? sb.ToString() : null;
+        }
+        catch { return null; }
+    }
+
     public static string? ForegroundApp()
     {
         try

@@ -46,6 +46,25 @@ function PairingCard({ device, refresh }: { device: Device; refresh: () => void 
   );
 }
 
+function UninstallPin({ deviceId }: { deviceId: string }) {
+  const [pin, setPin] = useState<string | null>(null);
+  const [err, setErr] = useState("");
+  return (
+    <section className="card space-y-2">
+      <h3 className="font-semibold">Mã gỡ cài đặt</h3>
+      <p className="text-sm text-slate-500">Cần khi gỡ Agent khỏi máy Windows (hoạt động cả khi máy offline). Đổi mỗi ngày.</p>
+      {pin ? (
+        <div data-testid="uninstall-pin" className="text-center font-mono text-3xl font-bold tracking-widest">{pin}</div>
+      ) : (
+        <button className="btn w-full bg-slate-200" onClick={async () => {
+          try { setPin((await api<{ pin: string }>(`/api/devices/${deviceId}/uninstall-pin`)).pin); } catch (e) { setErr((e as Error).message); }
+        }}>Hiện mã hôm nay</button>
+      )}
+      {err && <p className="text-sm text-red-600">{err}</p>}
+    </section>
+  );
+}
+
 export function ControlTab(p: {
   device: Device;
   policy: Policy;
@@ -111,6 +130,7 @@ export function ControlTab(p: {
           </div>
         ))}
       </section>
+      <UninstallPin deviceId={d.id} />
       <button className="w-full py-3 text-sm text-red-600" onClick={p.onDelete}>Xóa máy này</button>
     </>
   );

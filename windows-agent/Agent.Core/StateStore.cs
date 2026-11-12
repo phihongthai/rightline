@@ -26,6 +26,12 @@ public sealed class AgentState
     public double ActiveSeconds { get; set; }
     /// <summary>Local date (yyyy-MM-dd) that ActiveSeconds belongs to.</summary>
     public string? ActiveDate { get; set; }
+    /// <summary>Adapter id -> DNS servers it had before we redirected it to the local proxy.</summary>
+    public Dictionary<string, string[]> OriginalDns { get; set; } = new();
+    /// <summary>Tamper alerts not yet delivered (survive restarts).</summary>
+    public List<string> PendingAlerts { get; set; } = [];
+    /// <summary>Set while the service runs; still set at startup = previous run was killed / power loss.</summary>
+    public DateTimeOffset? RunningSince { get; set; }
     public bool Paired => DeviceToken is not null;
 }
 

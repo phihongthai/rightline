@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Net;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -8,6 +9,8 @@ public sealed class AgentOptions
 {
     public string BackendUrl { get; set; } = "http://localhost:3000";
     public string StatePath { get; set; } = "state.bin";
+    /// <summary>Directory for the offline screenshot queue. null = screenshots disabled.</summary>
+    public string? QueueDir { get; set; }
     public string MachineName { get; set; } = Environment.MachineName;
     public string OsVersion { get; set; } = Environment.OSVersion.ToString();
     public string AgentVersion { get; set; } = "0.1.0";
@@ -18,11 +21,21 @@ public sealed class AgentOptions
     /// <summary>Helper idle reports older than this are ignored (helper dead/not logged in).</summary>
     public double IdleReportMaxAgeSeconds { get; set; } = 15;
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Local DNS proxy bind address (127.0.0.1:53 in production). null = no DNS filtering.</summary>
+    public IPEndPoint? DnsListen { get; set; }
+    /// <summary>Used when the "adult" category is on (Cloudflare family: blocks malware + adult).</summary>
+    public IPEndPoint DnsUpstreamFamily { get; set; } = new(IPAddress.Parse("1.1.1.3"), 53);
+    public IPEndPoint DnsUpstreamDefault { get; set; } = new(IPAddress.Parse("8.8.8.8"), 53);
+    public TimeSpan LogFlushInterval { get; set; } = TimeSpan.FromSeconds(60);
+    public TimeSpan NetworkVerifyInterval { get; set; } = TimeSpan.FromSeconds(30);
+    public TimeSpan AlertThrottle { get; set; } = TimeSpan.FromMinutes(5);
 }
 
 /// <summary>
 /// Brain of Agent.Service: owns persisted state, evaluates lock decisions every tick,
-/// talks to the backend and to the user-session Helper. Platform-neutral so it can be tested anywhere.
+/// talks to the backend and to the user-session Helper, runs the DNS filter and uploads telemetry.
+/// Platform-neutral; Windows specifics come in through <see cref="AgentPlatform"/>.
 /// </summary>
 public sealed class AgentController
 {
@@ -31,7 +44,12 @@ public sealed class AgentController
     private readonly TimeProvider _time;
     private readonly ILogger _log;
     private readonly IpcServer _ipc;
+    private readonly AgentPlatform _platform;
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private readonly DomainFilter _filter = new();
+    private readonly ActivityLog _activity;
+    private readonly ScreenshotUploader? _shots;
+    private readonly Dictionary<string, DateTimeOffset> _alertLast = new();
     private readonly object _lock = new();
 
     private AgentState _state;
@@ -39,38 +57,66 @@ public sealed class AgentController
     private CancellationTokenSource? _syncCts;
     private Task? _syncTask;
     private CancellationToken _stopping;
+    private DnsProxy? _dns;
 
     private double _idleSeconds = double.MaxValue;
     private DateTimeOffset _idleReportedAt = DateTimeOffset.MinValue;
-    private string? _foregroundApp;
+    private string? _foregroundApp, _foregroundTitle;
     private bool _online;
     private long _lastTick;
-    private DateTimeOffset _lastSave = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastSave = DateTimeOffset.MinValue, _lastFlush, _lastNetVerify;
     private HelperState? _lastPublished;
     private bool _dirty;
+    private int _flushing;
 
-    public AgentController(AgentOptions options, IProtector protector, TimeProvider time, Func<NamedPipeServerStream> createPipe, ILogger? logger = null,
-        Func<NamedPipeServerStream, bool>? authorizeClient = null)
+    /// <summary>Raised after a new policy has been applied (the Windows layer re-sweeps running processes).</summary>
+    public event Action? PolicyApplied;
+
+    public AgentController(AgentOptions options, IProtector protector, TimeProvider time, Func<NamedPipeServerStream> createPipe,
+        ILogger? logger = null, Func<NamedPipeServerStream, bool>? authorizeClient = null, AgentPlatform? platform = null)
     {
         _o = options;
         _time = time;
         _log = logger ?? NullLogger.Instance;
+        _platform = platform ?? new AgentPlatform();
         _store = new StateStore(options.StatePath, protector);
         _state = _store.Load();
+        _activity = new ActivityLog(time);
+        if (options.QueueDir is not null) _shots = new ScreenshotUploader(_http, options.BackendUrl, options.QueueDir);
         _ipc = new IpcServer(createPipe, authorizeClient);
         _ipc.MessageReceived += OnIpcAsync;
         _ipc.ClientConnected += () => _ = PublishAsync(force: true);
+        _ipc.ClientRejected += () => QueueTamper("impostor_pipe_client");
         _lastTick = time.GetTimestamp();
+        _lastFlush = _lastNetVerify = time.GetLocalNow();
     }
 
     // ---- read-only views (tests/diagnostics) ----
     public AgentState Snapshot() { lock (_lock) return Json.Deserialize<AgentState>(Json.Serialize(_state))!; }
     public LockDecision CurrentDecision() { lock (_lock) return Decide(_time.GetLocalNow()); }
+    public IPEndPoint? DnsEndPoint => _dns?.UdpEndPoint;
+
+    public bool ShouldBlockProcess(string processName)
+    {
+        Policy? p;
+        lock (_lock) p = _state.Paired ? _state.Policy : null;
+        return AppBlockMatcher.ShouldBlock(p, processName, _time.GetLocalNow());
+    }
+
+    public void ReportBlockedApp(string processName) => _activity.RecordSystem("blocked_app", processName);
 
     public async Task RunAsync(CancellationToken ct)
     {
         _stopping = ct;
+        lock (_lock)
+        {
+            if (_state.RunningSince is not null) QueueTamperLocked("unclean_shutdown");
+            _state.RunningSince = _time.GetUtcNow();
+            _store.Save(_state);
+        }
         var ipcTask = _ipc.RunAsync(ct);
+        StartDns();
+        EnforceNetwork();
         StartSync();
         try
         {
@@ -80,10 +126,22 @@ public sealed class AgentController
         catch (OperationCanceledException) { }
         finally
         {
-            lock (_lock) _store.Save(_state);
+            lock (_lock) { _state.RunningSince = null; _store.Save(_state); }
             StopSync();
+            if (_dns is not null) await _dns.DisposeAsync();
             try { await ipcTask; } catch { /* ignore */ }
             if (_syncTask is not null) try { await _syncTask; } catch { /* ignore */ }
+        }
+    }
+
+    /// <summary>Uninstall path: undo every system change (DNS back to what it was, DoH policies removed).</summary>
+    public void Cleanup()
+    {
+        lock (_lock)
+        {
+            if (_platform.Dns is { } dns) new DnsGuard(dns, _state.OriginalDns).Restore();
+            if (_platform.BrowserPolicy is { } w) DohPolicy.Apply(w, enabled: false);
+            _store.Save(_state);
         }
     }
 
@@ -102,7 +160,10 @@ public sealed class AgentController
 
             var idleFresh = (now - _idleReportedAt).TotalSeconds <= _o.IdleReportMaxAgeSeconds;
             if (_state.Paired && idleFresh && _idleSeconds < _o.IdleThresholdSeconds && !Decide(now).Locked)
+            {
                 _state.ActiveSeconds += elapsed;
+                _activity.RecordApp(_foregroundApp, _foregroundTitle, elapsed);
+            }
 
             if (_dirty || now - _lastSave >= _o.SaveInterval)
             {
@@ -111,6 +172,9 @@ public sealed class AgentController
                 _dirty = false;
             }
         }
+
+        if (now - _lastNetVerify >= _o.NetworkVerifyInterval) { _lastNetVerify = now; EnforceNetwork(); }
+        if (now - _lastFlush >= _o.LogFlushInterval) { _lastFlush = now; _ = FlushBackgroundAsync(); }
         await PublishAsync(force: false);
     }
 
@@ -125,7 +189,9 @@ public sealed class AgentController
         {
             var d = Decide(_time.GetLocalNow());
             return new HelperState(_state.Paired, d.Locked, d.Code, d.Message, _online,
-                (int)(_state.ActiveSeconds / 60), _state.Policy?.DailyLimitMinutes, _state.ExtraTimeUntil);
+                (int)(_state.ActiveSeconds / 60), _state.Policy?.DailyLimitMinutes, _state.ExtraTimeUntil,
+                ScreenshotEnabled: _state.Paired && _shots is not null && _state.Policy?.ProtectionFlags.Screenshot == true,
+                ScreenshotIntervalSec: _state.Policy?.ScreenshotIntervalSec ?? 60);
         }
     }
 
@@ -137,6 +203,104 @@ public sealed class AgentController
         await _ipc.SendAsync(IpcNames.State, s);
     }
 
+    // ---- web filter: DNS proxy, adapter redirect, DoH policy ----
+    private void StartDns()
+    {
+        if (_o.DnsListen is null) return;
+        try
+        {
+            var dns = new DnsProxy(_o.DnsListen, name => _filter.Decide(name, PolicyForFilter()), ChooseUpstream,
+                (domain, blocked) => { if (WebFilterOn()) _activity.RecordDomain(domain, blocked); });
+            dns.Start();
+            _dns = dns;
+        }
+        catch (Exception ex)
+        {
+            // Never redirect system DNS to a proxy that isn't listening: that would cut the internet.
+            _log.LogError(ex, "DNS proxy could not start on {Endpoint}; web filtering disabled", _o.DnsListen);
+        }
+    }
+
+    private Policy? PolicyForFilter() { lock (_lock) return _state.Paired ? _state.Policy : null; }
+    private bool WebFilterOn() { lock (_lock) return _state.Paired && _state.Policy?.ProtectionFlags.WebFilter == true; }
+
+    private IPEndPoint ChooseUpstream()
+    {
+        var p = PolicyForFilter();
+        return p is { ProtectionFlags.WebFilter: true } && p.BlockedCategories.Contains("adult") ? _o.DnsUpstreamFamily : _o.DnsUpstreamDefault;
+    }
+
+    /// <summary>Idempotent: (re)applies adapter DNS + DoH policy to match the policy; reports tampering.</summary>
+    internal void EnforceNetwork()
+    {
+        try
+        {
+            lock (_lock)
+            {
+                var web = WebFilterOn();
+                if (_platform.Dns is { } dns)
+                {
+                    var guard = new DnsGuard(dns, _state.OriginalDns);
+                    if (web && _dns is not null)
+                    {
+                        var reverted = guard.Enforce();
+                        if (reverted.Count > 0) QueueTamperLocked("dns_changed:" + string.Join(",", reverted));
+                    }
+                    else if (!web) guard.Restore();
+                    _dirty = true;
+                }
+                if (_platform.BrowserPolicy is { } w) DohPolicy.Apply(w, web);
+            }
+        }
+        catch (Exception ex) { _log.LogError(ex, "network enforcement failed"); }
+    }
+
+    // ---- tamper alerts ----
+    private void QueueTamper(string detail) { lock (_lock) QueueTamperLocked(detail); }
+
+    private void QueueTamperLocked(string detail)
+    {
+        if (!_state.Paired) return;
+        var now = _time.GetUtcNow();
+        var key = detail.Split(':')[0];
+        if (_alertLast.TryGetValue(key, out var last) && now - last < _o.AlertThrottle) return;
+        _alertLast[key] = now;
+        _state.PendingAlerts.Add(detail);
+        if (_state.PendingAlerts.Count > 20) _state.PendingAlerts.RemoveAt(0);
+        _activity.RecordSystem("tamper", detail);
+        _dirty = true;
+    }
+
+    private async Task FlushAlertsAsync()
+    {
+        var c = _client;
+        if (c is null || !c.IsConnected) return;
+        string[] pending;
+        lock (_lock) pending = _state.PendingAlerts.ToArray();
+        foreach (var a in pending)
+        {
+            if (!await c.SendAsync("alert:tamper", new { detail = a })) return;
+            lock (_lock) { _state.PendingAlerts.Remove(a); _dirty = true; }
+        }
+    }
+
+    // ---- telemetry upload ----
+    private async Task FlushBackgroundAsync()
+    {
+        if (Interlocked.Exchange(ref _flushing, 1) == 1) return;
+        try
+        {
+            string? token;
+            lock (_lock) token = _state.DeviceToken;
+            if (token is null) return;
+            await _activity.FlushAsync(_http, _o.BackendUrl, token, _stopping);
+            if (_shots is not null) await _shots.FlushAsync(token, _stopping);
+            await FlushAlertsAsync();
+        }
+        catch (Exception ex) { _log.LogDebug(ex, "background flush failed"); }
+        finally { Volatile.Write(ref _flushing, 0); }
+    }
+
     // ---- backend sync ----
     private void StartSync()
     {
@@ -146,10 +310,10 @@ public sealed class AgentController
         StopSync();
         var cts = CancellationTokenSource.CreateLinkedTokenSource(_stopping);
         var client = new BackendClient(_o.BackendUrl, token, BuildHeartbeat, _log) { HeartbeatInterval = _o.HeartbeatInterval };
-        client.PolicyReceived += p => Mutate(s => s.Policy = p);
+        client.PolicyReceived += p => { Mutate(s => s.Policy = p); EnforceNetwork(); PolicyApplied?.Invoke(); };
         client.LockChanged += l => Mutate(s => s.ManualLocked = l);
         client.TimeGranted += t => Mutate(s => s.ExtraTimeUntil = t);
-        client.ConnectionChanged += c => { _online = c; _ = PublishAsync(force: false); };
+        client.ConnectionChanged += c => { _online = c; _ = PublishAsync(force: false); if (c) _ = FlushBackgroundAsync(); };
         client.Unauthorized += () => _log.LogWarning("device token rejected by server");
         _client = client;
         _syncCts = cts;
@@ -191,6 +355,7 @@ public sealed class AgentController
                     _idleSeconds = idle.IdleSeconds;
                     _idleReportedAt = _time.GetLocalNow();
                     _foregroundApp = idle.ForegroundApp;
+                    _foregroundTitle = idle.ForegroundTitle;
                 }
                 break;
 
@@ -201,8 +366,25 @@ public sealed class AgentController
             case IpcNames.TimeRequest:
                 if (m.Payload.As<TimeRequestPayload>() is { } tr) await RequestTimeAsync(tr);
                 break;
+
+            case IpcNames.Screenshot:
+                if (m.Payload.As<ScreenshotPayload>() is { } sp) OnScreenshot(sp);
+                break;
         }
     }
+
+    private void OnScreenshot(ScreenshotPayload sp)
+    {
+        if (_shots is null || !WebFilterOrScreenshotAllowed() || sp.Data.Length > ScreenshotUploader.MaxBytes * 2) return;
+        byte[] jpeg;
+        try { jpeg = Convert.FromBase64String(sp.Data); } catch (FormatException) { return; }
+        // Sanity: JPEG magic bytes, and never trust a client-supplied future timestamp.
+        if (jpeg.Length < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) return;
+        var at = sp.CapturedAt > _time.GetUtcNow() ? _time.GetUtcNow() : sp.CapturedAt;
+        if (_shots.Enqueue(jpeg, at)) _ = FlushBackgroundAsync();
+    }
+
+    private bool WebFilterOrScreenshotAllowed() { lock (_lock) return _state.Paired && _state.Policy?.ProtectionFlags.Screenshot == true; }
 
     private async Task PairAsync(PairSubmitPayload ps)
     {
@@ -219,6 +401,7 @@ public sealed class AgentController
                     DeviceId = res.DeviceId,
                     DeviceToken = res.DeviceToken,
                     ActiveDate = _time.GetLocalNow().ToString("yyyy-MM-dd"),
+                    RunningSince = _time.GetUtcNow(),
                 };
                 _store.Save(_state);
             }

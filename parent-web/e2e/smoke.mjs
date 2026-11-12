@@ -53,6 +53,11 @@ await page.getByText("Online").first().waitFor({ timeout: 10000 });
 await page.getByText("1g 15p").waitFor();
 step("device shows online + usage");
 
+// uninstall PIN
+await page.getByRole("button", { name: "Hiện mã hôm nay" }).click();
+assert.match((await page.getByTestId("uninstall-pin").textContent()).trim(), /^\d{8}$/);
+step("uninstall pin shown");
+
 // toggle
 await page.getByRole("switch", { name: "Chụp màn hình" }).click();
 let m = await waitMsg("policy:sync", (m) => m.payload.protection_flags.screenshot === false);

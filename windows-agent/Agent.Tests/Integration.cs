@@ -141,6 +141,100 @@ public class BackendIntegrationTests
         await Task.WhenAny(run3, Task.Delay(5000));
     }
 
+    static byte[] DnsQuery(string name)
+    {
+        var m = new MemoryStream();
+        m.Write([0x42, 0x42, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+        foreach (var l in name.Split('.')) { m.WriteByte((byte)l.Length); m.Write(System.Text.Encoding.ASCII.GetBytes(l)); }
+        m.WriteByte(0); m.Write([0, 1, 0, 1]);
+        return m.ToArray();
+    }
+
+    static async Task<byte[]> Ask(System.Net.IPEndPoint ep, byte[] q)
+    {
+        using var u = new System.Net.Sockets.UdpClient();
+        await u.SendAsync(q, ep);
+        var t = u.ReceiveAsync();
+        if (await Task.WhenAny(t, Task.Delay(4000)) != t) throw new TimeoutException("dns");
+        return t.Result.Buffer;
+    }
+
+    /// <summary>Needs the backend AND a storage stand-in on :9000 (backend/test/fake-s3.mjs or MinIO).</summary>
+    [IntegrationFact]
+    public async Task Telemetry_dns_filter_tamper_and_uninstall_auth_against_real_backend()
+    {
+        var parent = new Parent();
+        await parent.InitAsync();
+        using var upstream = new DnsTests.Upstream();
+        var dns = new NetworkGuardTests.FakeDns();
+        dns.A["a"] = new("a", "Wi-Fi", ["192.168.1.1"]);
+
+        var statePath = T.TempFile();
+        var queue = Path.Combine(Path.GetDirectoryName(statePath)!, "shots");
+        var pipe = T.PipeName();
+        var agent = new AgentController(new AgentOptions
+        {
+            BackendUrl = Base, StatePath = statePath, QueueDir = queue, TickInterval = TimeSpan.FromMilliseconds(100),
+            HeartbeatInterval = TimeSpan.FromSeconds(1), LogFlushInterval = TimeSpan.FromSeconds(1), SaveInterval = TimeSpan.Zero,
+            DnsListen = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0),
+            DnsUpstreamDefault = upstream.EndPoint, DnsUpstreamFamily = upstream.EndPoint,
+        }, new XorProtector(), TimeProvider.System, T.PipeFactory(pipe), platform: new AgentPlatform { Dns = dns });
+        using var cts = new CancellationTokenSource();
+        var run = agent.RunAsync(cts.Token);
+        await using var helper = await T.ConnectHelper(pipe);
+
+        await helper.SendAsync(IpcNames.PairSubmit, new PairSubmitPayload(parent.Code, "BO-PC"));
+        Assert.True((await NextResult(helper, IpcNames.PairResult)).Ok);
+        var st = await NextState(helper, s => s.Paired && s.Online && s.ScreenshotEnabled);
+        Assert.Equal(60, st.ScreenshotIntervalSec);
+
+        // --- policy -> DNS filter + adapter redirect
+        await parent.Patch(new { custom_blocked_domains = new[] { "bad.example.com" }, blocked_categories = new string[0], screenshot_interval_sec = 30 });
+        await Eventually(() => Task.FromResult(agent.Snapshot().Policy?.CustomBlockedDomains.Contains("bad.example.com") == true));
+        await Eventually(() => Task.FromResult(dns.A["a"].Servers is ["127.0.0.1"]));
+        var ep = agent.DnsEndPoint!;
+        Assert.Equal(new byte[] { 0, 0, 0, 0 }, (await Ask(ep, DnsQuery("x.bad.example.com")))[^4..]);
+        Assert.Equal(new byte[] { 9, 9, 9, 9 }, (await Ask(ep, DnsQuery("ok.example.com")))[^4..]);
+
+        // --- activity + screenshot
+        for (int i = 0; i < 12; i++) { await helper.SendAsync(IpcNames.Idle, new IdlePayload(0, "chrome.exe", "Khan Academy")); await Task.Delay(200); }
+        var jpeg = new byte[] { 0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 0xFF, 0xD9 };
+        await helper.SendAsync(IpcNames.Screenshot, new ScreenshotPayload(DateTimeOffset.UtcNow, Convert.ToBase64String(jpeg)));
+
+        await Eventually(async () =>
+        {
+            var logs = (await parent.Get("/logs?limit=200")).GetProperty("logs").EnumerateArray().ToList();
+            return logs.Any(l => l.GetProperty("target").GetString() == "chrome.exe" && l.GetProperty("title").GetString() == "Khan Academy" && l.GetProperty("duration_sec").GetInt32() >= 1)
+                && logs.Any(l => l.GetProperty("log_type").GetString() == "web" && l.GetProperty("target").GetString() == "x.bad.example.com" && l.GetProperty("title").GetString() == "blocked")
+                && logs.Any(l => l.GetProperty("target").GetString() == "ok.example.com");
+        }, 15000);
+        await Eventually(async () => (await parent.Get("/screenshots")).GetProperty("screenshots").GetArrayLength() == 1, 15000);
+        Assert.Empty(Directory.GetFiles(queue, "*.jpg"));                 // deleted after upload
+
+        // --- tamper: kid points the adapter somewhere else
+        dns.A["a"] = dns.A["a"] with { Servers = ["8.8.4.4"] };
+        agent.EnforceNetwork();
+        Assert.Equal(["127.0.0.1"], dns.A["a"].Servers);
+        await Eventually(async () => (await parent.Get("/logs?type=system&limit=50")).GetProperty("logs").EnumerateArray()
+            .Any(l => l.GetProperty("target").GetString() == "tamper" && l.GetProperty("title").GetString()!.StartsWith("dns_changed:Wi-Fi")), 15000);
+
+        // --- uninstall authorisation: password (online), daily PIN (offline), wrong secret
+        var snap = agent.Snapshot();
+        using var http = new HttpClient();
+        Assert.Equal(0, await UninstallAuth.VerifyAsync(snap, "password123", http, Base, TimeProvider.System));
+        Assert.Equal(1, await UninstallAuth.VerifyAsync(snap, "not-the-password", http, Base, TimeProvider.System));
+        var pin = (await GetPin(parent)).GetProperty("pin").GetString()!;
+        Assert.Equal(0, await UninstallAuth.VerifyAsync(snap, pin, http, "http://127.0.0.1:1", TimeProvider.System));
+        Assert.Equal(2, await UninstallAuth.VerifyAsync(snap, "12345678", http, "http://127.0.0.1:1", TimeProvider.System));
+
+        cts.Cancel();
+        await Task.WhenAny(run, Task.Delay(5000));
+        agent.Cleanup();
+        Assert.Equal(["192.168.1.1"], dns.A["a"].Servers);                // uninstall restores the original DNS
+    }
+
+    static async Task<JsonElement> GetPin(Parent p) => await p.Get("/uninstall-pin");
+
     static async Task Eventually(Func<Task<bool>> cond, int ms = 8000)
     {
         var end = DateTime.UtcNow.AddMilliseconds(ms);

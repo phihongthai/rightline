@@ -12,11 +12,14 @@ public sealed class HelperHost(Dispatcher ui)
     private LockWindow? _lock;
     private PairWindow? _pair;
     private DateTime _pairClosedAt = DateTime.MinValue;
+    private HelperState? _state;
+    private DateTime _lastShot = DateTime.MinValue;
 
     public void Start()
     {
         _ = Task.Run(() => ConnectLoopAsync(_cts.Token));
         _ = Task.Run(() => IdleLoopAsync(_cts.Token));
+        _ = Task.Run(() => ScreenshotLoopAsync(_cts.Token));
     }
 
     public void Stop()
@@ -54,11 +57,36 @@ public sealed class HelperHost(Dispatcher ui)
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
         try
         {
-            do { await SendAsync(IpcNames.Idle, new IdlePayload(NativeMethods.IdleSeconds(), NativeMethods.ForegroundApp())); }
+            do { await SendAsync(IpcNames.Idle, new IdlePayload(NativeMethods.IdleSeconds(), NativeMethods.ForegroundApp(), NativeMethods.ForegroundTitle())); }
             while (await timer.WaitForNextTickAsync(ct));
         }
         catch (OperationCanceledException) { }
         catch (Exception) { /* pipe hiccup; next tick retries */ }
+    }
+
+    /// <summary>Screenshots only while unlocked and the user is actually interacting (idle &lt; 60s).</summary>
+    private async Task ScreenshotLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                var s = _state;
+                if (s is not { Paired: true, Locked: false, ScreenshotEnabled: true }) continue;
+                if (DateTime.UtcNow - _lastShot < TimeSpan.FromSeconds(Math.Clamp(s.ScreenshotIntervalSec, 15, 300))) continue;
+                if (NativeMethods.IdleSeconds() >= 60) continue;
+                try
+                {
+                    var jpeg = ScreenCapture.CaptureJpeg();
+                    if (jpeg is null) continue;
+                    _lastShot = DateTime.UtcNow;
+                    await SendAsync(IpcNames.Screenshot, new ScreenshotPayload(DateTimeOffset.UtcNow, Convert.ToBase64String(jpeg)));
+                }
+                catch (Exception) { /* capture/pipe hiccup; try again next interval */ }
+            }
+        }
+        catch (OperationCanceledException) { }
     }
 
     // ---- UI thread ----
@@ -80,6 +108,7 @@ public sealed class HelperHost(Dispatcher ui)
 
     private void ApplyState(HelperState s)
     {
+        _state = s;
         if (!s.Paired)
         {
             if (_pair is null && DateTime.UtcNow - _pairClosedAt > TimeSpan.FromMinutes(1))
