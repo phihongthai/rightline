@@ -52,7 +52,7 @@ export async function buildApp(overrides: Partial<Deps> = {}): Promise<FastifyIn
   const app = Fastify({ logger: process.env.NODE_ENV === "test" ? false : true });
   app.decorate("deps", deps);
 
-  await app.register(cors, { origin: config.corsOrigin.split(","), credentials: true });
+  await app.register(cors, { origin: config.corsOrigin.split(","), credentials: true, methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] });
   await app.register(jwt, { secret: config.jwtSecret, sign: { expiresIn: "30d" } });
   await app.register(rateLimit, { global: false });
   await app.register(websocket);
