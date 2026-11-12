@@ -1,0 +1,107 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  createdAt    DateTime @default(now()) @map("created_at")
+  devices      Device[]
+
+  @@map("users")
+}
+
+model Device {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           String    @map("user_id") @db.Uuid
+  name             String
+  osVersion        String?   @map("os_version")
+  agentVersion     String?   @map("agent_version")
+  pairingCode      String?   @unique @map("pairing_code") @db.VarChar(6)
+  pairingExpiresAt DateTime? @map("pairing_expires_at")
+  deviceTokenHash  String?   @unique @map("device_token_hash")
+  isOnline         Boolean   @default(false) @map("is_online")
+  lastSeenAt       DateTime? @map("last_seen_at")
+  isLockedNow      Boolean   @default(false) @map("is_locked_now")
+  manualLocked     Boolean   @default(false) @map("manual_locked")
+  extraTimeUntil   DateTime? @map("extra_time_until")
+  activeMinutesToday Int     @default(0) @map("active_minutes_today")
+  currentApp       String?   @map("current_app")
+  licenseExpiresAt DateTime  @map("license_expires_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  policy       Policy?
+  timeRequests TimeRequest[]
+  screenshots  Screenshot[]
+  activityLogs ActivityLog[]
+
+  @@index([userId])
+  @@map("devices")
+}
+
+model Policy {
+  deviceId             String @id @map("device_id") @db.Uuid
+  version              Int    @default(1)
+  protectionFlags      Json   @map("protection_flags")
+  scheduleGrid         Json   @map("schedule_grid")
+  dailyLimitMinutes    Int?   @map("daily_limit_minutes")
+  blockedCategories    String[] @map("blocked_categories")
+  customBlockedDomains String[] @map("custom_blocked_domains")
+  customAllowedDomains String[] @map("custom_allowed_domains")
+  blockedApps          Json   @map("blocked_apps")
+  screenshotIntervalSec Int   @default(60) @map("screenshot_interval_sec")
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@map("policies")
+}
+
+model TimeRequest {
+  id               String    @id @default(uuid()) @db.Uuid
+  deviceId         String    @map("device_id") @db.Uuid
+  requestedMinutes Int       @map("requested_minutes")
+  reason           String    @default("")
+  status           String    @default("pending")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  resolvedAt       DateTime? @map("resolved_at")
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, status])
+  @@map("time_requests")
+}
+
+model Screenshot {
+  id         String   @id @default(uuid()) @db.Uuid
+  deviceId   String   @map("device_id") @db.Uuid
+  storageKey String   @map("storage_key")
+  capturedAt DateTime @map("captured_at")
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, capturedAt(sort: Desc)])
+  @@map("screenshots")
+}
+
+model ActivityLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  deviceId    String   @map("device_id") @db.Uuid
+  logType     String   @map("log_type")
+  target      String
+  title       String   @default("")
+  durationSec Int      @default(0) @map("duration_sec")
+  recordedAt  DateTime @map("recorded_at")
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, recordedAt(sort: Desc)])
+  @@map("activity_logs")
+}

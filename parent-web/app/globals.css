@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body { background: #f8fafc; -webkit-tap-highlight-color: transparent; }
+.btn { @apply rounded-xl px-4 py-3 text-base font-semibold active:scale-[0.98] transition disabled:opacity-50; }
+.card { @apply rounded-2xl bg-white p-4 shadow-sm ring-1 ring-slate-200; }
+.input { @apply w-full rounded-xl border border-slate-300 bg-white px-3 py-3 text-base outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200; }
